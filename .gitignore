@@ -1,3 +1,29 @@
+# MacOS
+.DS_Store
+
+# data folder
+data/
+# output folder
+output/
+
+# Jupyter Notebook checkpoints and others
+.ipynb_checkpoints
+.vscode/
+.idea/
+.pytest_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
