@@ -7,6 +7,7 @@ data/
 output/
 
 # Jupyter Notebook checkpoints and others
+.ipynb
 .ipynb_checkpoints
 .vscode/
 .idea/
