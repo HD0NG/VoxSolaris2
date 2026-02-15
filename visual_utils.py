@@ -44,6 +44,60 @@ def plot_shadow_polar(matrix, altitude_range, azimuth_range):
     
     plt.show()
 
+def plot_shadow_polar_refined(matrix_df):
+    """
+    Refined polar plot for shadow attenuation matrix.
+    Uses pcolormesh for a continuous hemispherical representation.
+    """
+    # 1. Extract and clean degree values from the DataFrame headers
+    # Assumes headers are 'Altitude_X' and 'Azimuth_Y'
+    altitudes = np.array([int(i.split('_')[1]) for i in matrix_df.index])
+    azimuths = np.array([int(c.split('_')[1]) for c in matrix_df.columns])
+
+    # 2. Create a grid for the polar plot
+    # Theta (Azimuth) and R (90 - Altitude for zenith-center)
+    theta, r = np.meshgrid(np.radians(azimuths), 90 - altitudes)
+    
+    # fig, ax = plt.subplots(figsize=(8, 8), subplot_kw={'projection': 'polar'})
+    fig, ax = plt.subplots(figsize=(8, 8), subplot_kw={'projection': 'polar'}, dpi=100)
+
+
+    # 3. Use pcolormesh for continuous shading
+    # matrix_df values represent (1 - transmittance)
+    pc = ax.pcolormesh(theta, r, matrix_df.values, cmap='Greys', shading='auto', vmin=0, vmax=1, edgecolors='face')
+    # levels = np.linspace(0, 1, 100)
+    # pc = ax.contourf(theta, r, matrix_df.values, levels=levels, cmap='Greys', extend='both')
+
+    # 4. Standardize for Hemispherical Photography (DHP) style
+    ax.set_theta_zero_location('N') # North at the top
+    ax.set_theta_direction(-1)      # Clockwise rotation
+    ax.set_ylim(0, 90)              # Center is Zenith (0), outer ring is Horizon (90)
+    
+    # Labeling for academic clarity
+
+    # Position y-labels at 0 degrees (North/Up)
+    ax.set_rlabel_position(0) 
+    
+    # Set y-ticks at 10-degree intervals
+    tick_positions = np.arange(10, 90, 10)
+    tick_labels = [f'{90 - p}°' for p in tick_positions] # Results in 80, 70, ..., 10
+
+    ax.set_yticks(tick_positions)
+    ax.set_yticklabels(tick_labels, fontsize=9, color='black')
+
+    ax.grid(True, linestyle='--', alpha=0.5)
+
+    # ax.set_yticklabels(['80°', '60°', '40°', '20°', '0°']) # Elevation labels
+    ax.set_title('Shadow Matrix Polar Plot\n(Voxel-Based API Model)\n', 
+                 va='bottom', fontsize=12)
+
+    # 5. Add professional colorbar
+    cbar = fig.colorbar(pc, ax=ax, pad=0.1, shrink=0.6, aspect=20)
+    cbar.set_label('Shadow Intensity (1 - Transmittance)', rotation=270, labelpad=15)
+    
+    plt.tight_layout()
+    plt.show()
+
 def plot_shadow_polar_in(matrix, altitude_range, azimuth_range):
     fig, ax = plt.subplots(subplot_kw={'projection': 'polar'})
 
