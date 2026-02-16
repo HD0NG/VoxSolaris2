@@ -15,7 +15,7 @@ OMEGA_S = 0.56
 
 TARGET_COORDS_2D = np.array([532884, 6983510])
 ROOF_SEARCH_RADIUS = 2.0  
-OFFSET_FROM_ROOF = 0.1    
+OFFSET_FROM_ROOF = 1.5    
 
 GROUND_CLASS = 2
 BUILDING_CLASS = 6
@@ -106,24 +106,28 @@ def voxelize_scene(points, classifications, voxel_size, beta=BETA_FINLAND):
 
     return class_grid, dens_grid, scene_min, grid_dims
 
-
 def generate_pv_array_points(center_coords, tilt_deg=12, az_deg=170, panel_width_m=1.0, panel_height_m=1.6, row_configuration=(5, 4, 3)):
     tilt_rad = np.radians(tilt_deg)
-    math_az_rad = np.radians(90 - az_deg)
+    rot_z_rad = np.radians(180 - az_deg)
 
     local_points = []
     num_rows = len(row_configuration)
-    
     total_height = (num_rows - 1) * panel_height_m
     y_steps = np.linspace(total_height / 2, -total_height / 2, num_rows)
     
+    # Find the maximum width so we can center the entire block over the origin point
+    max_width = max(row_configuration) * panel_width_m
+    
     for i, num_panels in enumerate(row_configuration):
         y = y_steps[i]
+        
+        # LEFT-ALIGNED: Every row starts at the same left edge
+        start_x = -max_width / 2
+        
         if num_panels == 1:
-            x_steps = [0.0]
+            x_steps = [start_x]
         else:
-            start_x = - (num_panels - 1) * panel_width_m / 2
-            end_x = (num_panels - 1) * panel_width_m / 2
+            end_x = start_x + (num_panels - 1) * panel_width_m
             x_steps = np.linspace(start_x, end_x, num_panels)
             
         for x in x_steps:
@@ -138,8 +142,8 @@ def generate_pv_array_points(center_coords, tilt_deg=12, az_deg=170, panel_width
     ])
     
     R_az = np.array([
-        [np.cos(math_az_rad), -np.sin(math_az_rad), 0],
-        [np.sin(math_az_rad),  np.cos(math_az_rad), 0],
+        [np.cos(rot_z_rad), -np.sin(rot_z_rad), 0],
+        [np.sin(rot_z_rad),  np.cos(rot_z_rad), 0],
         [0, 0, 1]
     ])
 
@@ -163,6 +167,8 @@ def calculate_ray_transmittance(origin, direction, scene_min, voxel_size, grid_d
     
     if not (0 <= ix < grid_dims[0] and 0 <= iy < grid_dims[1] and 0 <= iz < grid_dims[2]): return 1.0 
 
+    start_ix, start_iy, start_iz = ix, iy, iz
+
     step_x, step_y, step_z = (1 if direction[0] >= 0 else -1), (1 if direction[1] >= 0 else -1), (1 if direction[2] >= 0 else -1)
     t_delta_x = voxel_size / abs(direction[0]) if direction[0] != 0 else np.inf
     t_delta_y = voxel_size / abs(direction[1]) if direction[1] != 0 else np.inf
@@ -180,8 +186,13 @@ def calculate_ray_transmittance(origin, direction, scene_min, voxel_size, grid_d
         next_t = min(t_max_x, t_max_y, t_max_z)
         path_len = next_t - current_t 
         
-        if v_class == b_class or v_class == g_class: return 0.0
-        if 3 <= v_class <= 5: 
+        if v_class == b_class or v_class == g_class: 
+            if ix == start_ix and iy == start_iy and iz == start_iz:
+                pass 
+            else:
+                return 0.0
+
+        elif 3 <= v_class <= 5: 
             density = dens_grid[ix, iy, iz]
             if density > 0: transmittance *= math.exp(-k_eff * density * path_len)
         if transmittance < 1e-6: return 0.0
@@ -226,22 +237,38 @@ def create_shadow_matrix(lidar_file_path=None, voxel_size=1.0, output_dir=None, 
     analysis_center = np.array([TARGET_COORDS_2D[0], TARGET_COORDS_2D[1], target_z])
     array_points = generate_pv_array_points(analysis_center, tilt_deg=12, az_deg=170, panel_width_m=1.0, panel_height_m=1.6, row_configuration=(5, 4, 3))
     
-    tasks = [(el, az) for el in np.linspace(0, np.pi / 2, ELEVATION_STEPS, endpoint=True) for az in np.linspace(0, 2 * np.pi, AZIMUTH_STEPS, endpoint=False)]
+    # --- COMPUTATIONAL OPTIMIZATION CEILING ---
+    MAX_COMPUTE_ELEVATION = 55 
+    elevations = np.linspace(0, np.pi / 2, ELEVATION_STEPS, endpoint=True)
+    azimuths = np.linspace(0, 2 * np.pi, AZIMUTH_STEPS, endpoint=False)
+    
+    tasks = [(el, az) for el in elevations if np.rad2deg(el) <= MAX_COMPUTE_ELEVATION for az in azimuths]
     k_eff = K_BASE_FINLAND * OMEGA_S
 
     print(f"\n--- Starting PARALLEL Cone-Casting Simulation ---")
+    print(f"Optimized: Skipping elevations > {MAX_COMPUTE_ELEVATION}°. Processing {len(tasks)} directions...")
+    
     results = Parallel(n_jobs=-1, batch_size="auto")(
         delayed(process_single_solar_position)(el, az, array_points, scene_min, voxel_size, grid_dims, class_grid, dens_grid, k_eff, np.deg2rad(SOLAR_ANGULAR_RADIUS_DEG), buf_dist) 
         for el, az in tasks
     )
 
     df = pd.DataFrame(results)
-    df['azimuth_deg'], df['elevation_deg'] = np.round(np.rad2deg(df['azimuth'])).astype(int), np.round(np.rad2deg(df['elevation'])).astype(int)
+    df['azimuth_deg'] = np.round(np.rad2deg(df['azimuth'])).astype(int)
+    df['elevation_deg'] = np.round(np.rad2deg(df['elevation'])).astype(int)
     matrix_df = df.pivot_table(index='elevation_deg', columns='azimuth_deg', values='transmittance')
     
-    matrix_df.index, matrix_df.columns = [f"Altitude_{i}" for i in matrix_df.index], [f"Azimuth_{c}" for c in matrix_df.columns]
+    # Reindex to force the full 91x360 grid, automatically padding uncomputed high angles with NaN
+    matrix_df = matrix_df.reindex(index=range(91), columns=range(360))
+    
+    matrix_df.index = [f"Altitude_{i}" for i in matrix_df.index]
+    matrix_df.columns = [f"Azimuth_{c}" for c in matrix_df.columns]
+    
+    # Convert transmittance to shadow intensity
     matrix_df = 1 - matrix_df  
-    if 'Azimuth_0' in matrix_df.columns: matrix_df['Azimuth_360'] = matrix_df['Azimuth_0']
+    
+    if 'Azimuth_0' in matrix_df.columns: 
+        matrix_df['Azimuth_360'] = matrix_df['Azimuth_0']
     
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)

@@ -3,6 +3,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import laspy
 import plotly.express as px
+import copy
+import pvlib
+from sklearn.metrics import r2_score
 
 # import plotly.io as pio
 # For standard Jupyter Notebooks
@@ -134,6 +137,76 @@ def _open_las_any(path, prefer="auto"):
         )
     return laspy.open(path)
 
+def plot_shadow_matrix_with_sunpaths(matrix_path, lat=62.9798, lon=27.6486):
+    print("Loading shadow matrix...")
+    df = pd.read_csv(matrix_path, index_col=0)
+
+    azimuths = np.array([float(col.split('_')[1]) for col in df.columns])
+    elevations = np.array([float(idx.split('_')[1]) for idx in df.index])
+
+    r_grid = 90.0 - elevations
+    theta_grid = np.radians(azimuths)
+    Theta, R = np.meshgrid(theta_grid, r_grid)
+
+    fig, ax = plt.subplots(figsize=(12, 10), subplot_kw={'projection': 'polar'})
+    ax.set_theta_zero_location('N')  
+    ax.set_theta_direction(-1)       
+    ax.set_rlim(0, 90)               
+
+    yticks = range(0, 91, 10)
+    ax.set_yticks(yticks)
+    ax.set_yticklabels([f"{90-y}°" for y in yticks], color='black')
+
+    cmap = copy.copy(plt.cm.gray_r)
+    cmap.set_bad(color='#1e272e') # Deep slate color for missing data
+
+    c = ax.pcolormesh(Theta, R, df.values, cmap=cmap, vmin=0, vmax=1, shading='auto')
+    cbar = fig.colorbar(c, ax=ax, shrink=0.8, pad=0.1)
+    cbar.set_label('Shadow Intensity (1 - Transmittance)', rotation=270, labelpad=20)
+
+    print("Calculating seasonal sun paths...")
+    tz = 'Europe/Helsinki'
+    times_summer = pd.date_range('2021-06-21 00:00', '2021-06-21 23:59', freq='10min', tz=tz)
+    times_equinox = pd.date_range('2021-09-21 00:00', '2021-09-21 23:59', freq='10min', tz=tz)
+    times_winter = pd.date_range('2021-12-21 00:00', '2021-12-21 23:59', freq='10min', tz=tz)
+
+    sol_summer = pvlib.solarposition.get_solarposition(times_summer, lat, lon)
+    sol_equinox = pvlib.solarposition.get_solarposition(times_equinox, lat, lon)
+    sol_winter = pvlib.solarposition.get_solarposition(times_winter, lat, lon)
+
+    daylight_summer = sol_summer[sol_summer['elevation'] > 0].sort_values('azimuth')
+    daylight_equinox = sol_equinox[sol_equinox['elevation'] > 0]
+    daylight_winter = sol_winter[sol_winter['elevation'] > 0]
+
+    # --- DYNAMIC HATCHING FOR UNCOMPUTED ZONE ---
+    # Create an array of 360 degrees
+    theta_fill_deg = np.linspace(0, 360, 360)
+    theta_fill_rad = np.radians(theta_fill_deg)
+    
+    # Calculate the summer boundary + 2 deg buffer just like the raycaster
+    max_el_fill = np.interp(theta_fill_deg, daylight_summer['azimuth'].values, daylight_summer['elevation'].values, left=0, right=0) + 2.0
+    r_fill = 90 - max_el_fill # Convert elevation boundary to Zenith radius
+    
+    # Fill from the center (0) out to the r_fill boundary
+    ax.fill_between(theta_fill_rad, 0, r_fill, 
+                    color='white', edgecolor='#BFC6C4', hatch='/', 
+                    alpha=1.0, label='Uncomputed Zone (Outside Sun Path)')
+
+    # Plot the sun paths
+    ax.plot(np.radians(daylight_summer['azimuth']), daylight_summer['apparent_zenith'], 
+            color='#f1c40f', label='Summer Solstice (Jun 21)', linewidth=3)
+    ax.plot(np.radians(daylight_equinox['azimuth']), daylight_equinox['apparent_zenith'], 
+            color='#2ecc71', label='Equinox (Mar/Sep 21)', linewidth=3)
+    ax.plot(np.radians(daylight_winter['azimuth']), daylight_winter['apparent_zenith'], 
+            color='#3498db', label='Winter Solstice (Dec 21)', linewidth=3)
+
+    plt.title("Shadow Matrix Polar Plot\n", fontsize=14)
+    ax.legend(loc='lower left', bbox_to_anchor=(1.0, 1.0))
+    plt.tight_layout()
+    plt.show()
+
+
+
 def view_lidar_classes(
     filepath: str,
     sample: int = 200_000,
@@ -226,3 +299,52 @@ def view_lidar_classes(
     if show:
         fig.show()
     return fig
+
+def plot_publication_scatter(all_real, all_pred):
+    """
+    Generates an academic-grade scatter plot of Real vs. Predicted Power.
+    """
+    real_arr = np.array(all_real)
+    pred_arr = np.array(all_pred)
+    
+    # Filter out nighttime/zero-value data to prevent artificial R^2 inflation
+    mask = (real_arr > 50) | (pred_arr > 50)
+    real_filtered = real_arr[mask]
+    pred_filtered = pred_arr[mask]
+    
+    r2 = r2_score(real_filtered, pred_filtered)
+    
+    # Setup the plot
+    plt.figure(figsize=(9, 8))
+    
+    # The Scatter Data
+    plt.scatter(real_filtered, pred_filtered, alpha=0.25, color='#2980b9', edgecolors='none', s=30)
+    
+    # The 1:1 Perfect Alignment Line
+    max_val = max(real_filtered.max(), pred_filtered.max())
+    plt.plot([0, max_val], [0, max_val], 'k--', alpha=0.7, label='1:1 Perfect Prediction', lw=2)
+    
+    # The Linear Regression Trendline
+    z = np.polyfit(real_filtered, pred_filtered, 1)
+    p = np.poly1d(z)
+    
+    # Determine trendline equation string
+    sign = "+" if z[1] >= 0 else "-"
+    eq_str = f"y = {z[0]:.2f}x {sign} {abs(z[1]):.1f}"
+    
+    plt.plot(real_filtered, p(real_filtered), '#e74c3c', lw=2.5, 
+             label=f'Linear Fit: {eq_str}\n($R^2$ = {r2:.3f})')
+    
+    # Formatting
+    plt.title('Voxel-Based LiDAR Forecast vs. Real Power Output (Clear Days)', fontsize=14, pad=15)
+    plt.xlabel('Real Power Output (W)', fontsize=12)
+    plt.ylabel('LiDAR Shaded Forecast (W)', fontsize=12)
+    plt.xlim(0, max_val * 1.05)
+    plt.ylim(0, max_val * 1.05)
+    
+    # Move legend to the upper left to avoid covering high-power data points
+    plt.legend(loc='upper left', fontsize=11, framealpha=0.9)
+    plt.grid(True, linestyle=':', alpha=0.6)
+    
+    plt.tight_layout()
+    plt.show()
