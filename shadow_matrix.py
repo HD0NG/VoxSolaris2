@@ -4,13 +4,13 @@ import math
 import laspy
 import numpy as np
 import pandas as pd
-
+from numba import njit
 
 # --- CONFIGURATION (Zhang et al. 2024 Boreal Calibration) ---
 
 # Based on the Outokumpu site (near Kuopio), API-based beta is 2.63[cite: 276, 324, 429].
 # This accounts for the vertical (erectophile) foliage common in the region[cite: 324].
-BETA_FINLAND = 2.63 
+BETA_FINLAND = 2.08 
 # Effective extinction coefficient (k = 1/beta)[cite: 71, 73].
 K_BASE_FINLAND = 1.0 / BETA_FINLAND 
 
@@ -301,6 +301,97 @@ def trace_ray_fast(ray_origin, ray_direction, scene_min, voxel_size, grid_dims):
 import numpy as np
 
 # --- UPDATED RAY-TRACING ENGINE ---
+
+@njit(fastmath=True)
+def calculate_ray_transmittance(
+    ray_origin, ray_direction, scene_min, voxel_size, grid_dims, 
+    classification_grid, density_grid, k_eff, ground_class, building_class, buffer_dist=0.1
+):
+    """
+    Combined Amanatides-Woo ray traversal and Beer-Lambert attenuation.
+    Calculates exact path length through each voxel for accurate physics.
+    """
+    # 1. Apply buffer to avoid self-shadowing at the origin
+    adjusted_origin = ray_origin + (ray_direction * buffer_dist)
+    
+    # 2. Grid initialization
+    ray_pos = (adjusted_origin - scene_min) / voxel_size
+    ix = int(math.floor(ray_pos[0]))
+    iy = int(math.floor(ray_pos[1]))
+    iz = int(math.floor(ray_pos[2]))
+    
+    # Boundary check: Exit early if the ray starts outside the grid
+    if not (0 <= ix < grid_dims[0] and 0 <= iy < grid_dims[1] and 0 <= iz < grid_dims[2]):
+        return 1.0 
+
+    # Step directions
+    step_x = 1 if ray_direction[0] >= 0 else -1
+    step_y = 1 if ray_direction[1] >= 0 else -1
+    step_z = 1 if ray_direction[2] >= 0 else -1
+    
+    # Distance ray must travel to cross one voxel along each axis
+    t_delta_x = voxel_size / abs(ray_direction[0]) if ray_direction[0] != 0 else np.inf
+    t_delta_y = voxel_size / abs(ray_direction[1]) if ray_direction[1] != 0 else np.inf
+    t_delta_z = voxel_size / abs(ray_direction[2]) if ray_direction[2] != 0 else np.inf
+    
+    # Calculate distance to the first voxel boundaries
+    next_boundary_x = (ix + (1 if step_x > 0 else 0)) * voxel_size + scene_min[0]
+    next_boundary_y = (iy + (1 if step_y > 0 else 0)) * voxel_size + scene_min[1]
+    next_boundary_z = (iz + (1 if step_z > 0 else 0)) * voxel_size + scene_min[2]
+
+    t_max_x = (next_boundary_x - adjusted_origin[0]) / ray_direction[0] if ray_direction[0] != 0 else np.inf
+    t_max_y = (next_boundary_y - adjusted_origin[1]) / ray_direction[1] if ray_direction[1] != 0 else np.inf
+    t_max_z = (next_boundary_z - adjusted_origin[2]) / ray_direction[2] if ray_direction[2] != 0 else np.inf
+
+    transmittance = 1.0
+    current_t = 0.0  # Tracks total distance traveled along the ray
+    
+    while True:
+        # Exit if we step out of the grid bounds
+        if not (0 <= ix < grid_dims[0] and 0 <= iy < grid_dims[1] and 0 <= iz < grid_dims[2]):
+            break
+            
+        voxel_class = classification_grid[ix, iy, iz]
+        
+        # --- NEW: Exact Path Length Calculation ---
+        # The distance to the next voxel boundary minus the current distance
+        next_t = min(t_max_x, t_max_y, t_max_z)
+        path_length = next_t - current_t 
+        
+        # 1. Opaque objects block all light
+        if voxel_class == building_class or voxel_class == ground_class:
+            return 0.0
+            
+        # 2. Semi-transparent vegetation attenuation
+        # Assuming classes 3, 4, 5 are vegetation for speed
+        if 3 <= voxel_class <= 5: 
+            density = density_grid[ix, iy, iz]
+            if density > 0:
+                transmittance *= math.exp(-k_eff * density * path_length)
+                
+        # Early exit if light is effectively blocked
+        if transmittance < 1e-6:
+            return 0.0
+            
+        # --- Advance to the next voxel ---
+        current_t = next_t 
+        if t_max_x < t_max_y:
+            if t_max_x < t_max_z:
+                ix += step_x
+                t_max_x += t_delta_x
+            else:
+                iz += step_z
+                t_max_z += t_delta_z
+        else:
+            if t_max_y < t_max_z:
+                iy += step_y
+                t_max_y += t_delta_y
+            else:
+                iz += step_z
+                t_max_z += t_delta_z
+                
+    return transmittance
+
 
 def trace_ray_with_buffer(ray_origin, ray_direction, scene_min, voxel_size, grid_dims, buffer_dist=0.1):
     """

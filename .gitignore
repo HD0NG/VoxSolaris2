@@ -5,6 +5,7 @@
 data/
 # output folder
 output/
+results/
 
 # Jupyter Notebook checkpoints and others
 .ipynb

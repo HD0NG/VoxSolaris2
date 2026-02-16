@@ -9,7 +9,7 @@ from datetime import timedelta, datetime
 from sklearn.metrics import mean_squared_error
 import tqdm
 
-def find_clear_days(file_path, print_results=True):
+def find_clear_days(file_path, print_results=True, threshold=0.8):
     # 1. Efficiently count lines per day
     counts = collections.Counter()
     
@@ -30,13 +30,14 @@ def find_clear_days(file_path, print_results=True):
     
     # Define the "High Outlier" threshold
     # 1.5 is standard; use 3.0 for "Extreme" outliers
-    upper_bound = Q3 + 0.8 * IQR
+    upper_bound = Q3 + threshold * IQR
     
     # 4. Filter for statistically significant days
     significant_days = df[df['LineCount'] > upper_bound].copy()
     
     # Sort by count to get the most significant first
     significant_days = significant_days.sort_values(by='LineCount', ascending=False)
+    significant_days['Date'] = pd.to_datetime(significant_days['Date'], format='%Y %m %d').dt.date
     
     # 5. Output Results
     if print_results:
@@ -69,8 +70,8 @@ def get_extra_data(weather_path, radiation_path, target_date, interval='5T', cam
     df_resampled = df_ground.resample(interval).mean(numeric_only=True)
     
     # Slice for the target day
-    target_dt = pd.to_datetime(target_date).date()
-    df_day = df_resampled[df_resampled.index.date == target_dt].copy()
+    # target_dt = pd.to_datetime(target_date).date()
+    df_day = df_resampled[df_resampled.index.date == target_date].copy()
 
     # 2. Integrate CAMS All-Sky for DNI only
     if cams_email and not df_day.empty:
@@ -140,16 +141,23 @@ def apply_shadows(forecast_df, shadow_matrix, lat, lon):
     
     return df
 
-def apply_shadows_with_window(forecast_df, shadow_matrix, lat, lon, window_size=3):
+def apply_shadows_with_window(forecast_df, shadow_matrix, lat, lon, window_size=(5, 3)):
     df = forecast_df.copy()
     
     # 1. Calculate Solar Position
     solpos = pvlib.solarposition.get_solarposition(df.index, lat, lon)
     df['altitude'] = (90 - solpos['apparent_zenith']).round().fillna(0).astype(int)
-    df['azimuth'] = solpos['azimuth'].round().astype(int)
+    df['azimuth'] = solpos['azimuth'].round().fillna(0).astype(int)
     
-    # 2. Define the half-window offset (force integer)
-    offset = int(window_size // 2)
+    # 2. Define rectangular half-window offsets.
+    # window_size can be int (square) or tuple/list: (azimuth_width, altitude_width)
+    if isinstance(window_size, (tuple, list)) and len(window_size) == 2:
+        az_window, alt_window = int(window_size[0]), int(window_size[1])
+    else:
+        az_window = alt_window = int(window_size)
+
+    az_offset = int(az_window // 2)
+    alt_offset = int(alt_window // 2)
     
     def get_windowed_mean(row):
         # Altitude matrix index: Altitude_1 is at index 0
@@ -157,11 +165,11 @@ def apply_shadows_with_window(forecast_df, shadow_matrix, lat, lon, window_size=
         az_center = int(row['azimuth'])
         
         # Calculate slice boundaries and force integer types
-        alt_min = int(max(0, alt_center - offset))
-        alt_max = int(min(shadow_matrix.shape[0], alt_center + offset + 1))
+        alt_min = int(max(0, alt_center - alt_offset))
+        alt_max = int(min(shadow_matrix.shape[0], alt_center + alt_offset + 1))
         
-        az_min = int(max(0, az_center - offset))
-        az_max = int(min(shadow_matrix.shape[1], az_center + offset + 1))
+        az_min = int(max(0, az_center - az_offset))
+        az_max = int(min(shadow_matrix.shape[1], az_center + az_offset + 1))
         
         # Extract the sub-grid
         window = shadow_matrix[alt_min:alt_max, az_min:az_max]
@@ -178,13 +186,13 @@ def apply_shadows_with_window(forecast_df, shadow_matrix, lat, lon, window_size=
     
     return df
 
-def pv_analysis(target_date_str, shadow_matrix_df, excel_df, window_size=20, plot=True):
+def pv_analysis(target_date, shadow_matrix_df, excel_df, df_extra, window_size=(5, 3), plot=True):
     """
     Plots real power vs. forecast (with and without shadows) for a specific date.
     target_date_str: String in 'YYYY-MM-DD' format.
     """
     # 1. Date and Season Logic
-    target_date = datetime.strptime(target_date_str, '%Y-%m-%d').date()
+    # target_date = datetime.strptime(target_date_str, '%Y-%m-%d').date()
     # Summer Time (EEST) logic: April to October (simplified)
     is_summer = 3 < target_date.month < 11 
     
@@ -199,19 +207,26 @@ def pv_analysis(target_date_str, shadow_matrix_df, excel_df, window_size=20, plo
     day_data.index = day_data.index + timedelta(hours=inv_shift)
 
     day_data.loc[:, 'Power_W'] = day_data['Power_W'].fillna(0.0)
+
+    full_day_index = pd.date_range(
+        start=f"{target_date} 00:00:00", 
+        periods=288, 
+        freq='5min'
+        )
+    day_data = day_data.reindex(full_day_index, fill_value=0.0)
     
     # 3. Fetch Environmental and Forecast Data
     # pvfc settings
     pvfc.set_angles(12, 170)
     pvfc.set_location(62.979849, 27.648656)
-    pvfc.set_nominal_power_kw(3.68)
+    pvfc.set_nominal_power_kw(3.76)
     
     # Helper to get external radiation/weather data
-    df_extra = get_extra_data(
-        'data/pvdata/Kuopio Savilahti 1.4.2021 - 1.10.2021_temp_wind.csv', 
-        'data/pvdata/Kuopio Savilahti 1.4.2021 - 1.10.2021_radcsv', 
-        target_date_str, '5min', 'haoyang.dong@uef.fi'
-    )
+    # df_extra = get_extra_data(
+    #     'data/pvdata/Kuopio Savilahti 1.4.2021 - 1.10.2021_temp_wind.csv', 
+    #     'data/pvdata/Kuopio Savilahti 1.4.2021 - 1.10.2021_radcsv', 
+    #     target_date, '5min', 'haoyang.dong@uef.fi'
+    # )
     
     # Generate baseline forecast
     forecast_base = pvfc.process_radiation_df(df_extra)
@@ -235,7 +250,30 @@ def pv_analysis(target_date_str, shadow_matrix_df, excel_df, window_size=20, plo
     # Use .loc to explicitly set values and handle NaNs
     forecast_base.loc[:, 'output'] = forecast_base['output'].fillna(0.0)
     forecast_windowed.loc[:, 'output_shaded'] = forecast_windowed['output_shaded'].fillna(0.0)
+
+    forecast_base_clean = forecast_base[['output']].copy()
+    forecast_windowed_clean = forecast_windowed[['output_shaded']].copy()
+
+    day_start = forecast_base_clean.index[0].normalize()
+    full_day_idx_n = pd.date_range(start=day_start, periods=288, freq='5min')
+
+    # 3. Reindex to add missing timestamps and pad with 0.0
+    forecast_base_n = forecast_base_clean.reindex(full_day_idx_n, fill_value=0.0)
+    forecast_windowed_n = forecast_windowed_clean.reindex(full_day_idx_n, fill_value=0.0)
+    # forecast_base_clean.index.name = 'Timestamp'
+    # forecast_windowed_clean.index.name = 'Timestamp'
+
+    # full_day_index = pd.date_range(
+    #     start=f"{target_date} 00:00:00", 
+    #     periods=288, 
+    #     freq='5min'
+    #     )
     
+    # # Reindex all dataframes to the full day index
+    # forecast_base_clean = forecast_base_clean.reindex(full_day_index, fill_value=0.0)
+    # forecast_windowed_clean = forecast_windowed_clean.reindex(full_day_index, fill_value=0.0)
+    # day_data = day_data.reindex(full_day_index, fill_value=0.0)
+
     # 5. Plotting
     if plot:
         fig, ax = plt.subplots(figsize=(14, 6))
@@ -245,11 +283,11 @@ def pv_analysis(target_date_str, shadow_matrix_df, excel_df, window_size=20, plo
                 label='Real Power Output', color='#2ecc71', lw=1.5)
     
         # Baseline Model
-        ax.plot(forecast_base.index, forecast_base['output'], 
+        ax.plot(forecast_base_n.index, forecast_base_n['output'], 
                 label='FMI PV Forecast (No Shadows)', color='#3498db', linestyle='--')
         
         # Shaded Model (Our LiDAR refinement)
-        ax.plot(forecast_windowed.index, forecast_windowed['output_shaded'], 
+        ax.plot(forecast_windowed_n.index, forecast_windowed_n['output_shaded'], 
                 label='Forecast with Windowed Shadows', color='#e67e22', linestyle='-')
         
         # X-Axis Styling (Hourly, restricted to current day)
@@ -257,15 +295,42 @@ def pv_analysis(target_date_str, shadow_matrix_df, excel_df, window_size=20, plo
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
         ax.set_xlim(pd.Timestamp(target_date), pd.Timestamp(target_date) + timedelta(hours=23, minutes=59))
         
-        plt.title(f"PV Comparison & Shadow Impact: {target_date_str}")
+        plt.title(f"PV Comparison & Shadow Impact: {target_date}")
         plt.xlabel("Time (Helsinki Local)")
         plt.ylabel("Power (W)")
         plt.legend(loc='upper right')
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.show()
-    
-    return day_data, forecast_base, forecast_windowed
+
+
+    return day_data, forecast_base_n, forecast_windowed_n
+
+
+# evaluation function to compare forecast with and without shadows against real data (RMSE and energy error)
+def compute_metrics(day_data, forecast_base, forecast_windowed):
+
+    real = day_data['Power_W']
+    base = forecast_base['output']
+    shaded = forecast_windowed['output_shaded']
+
+    # Calculate RMSE
+    rmse_b = np.sqrt(mean_squared_error(real, base))
+    rmse_s = np.sqrt(mean_squared_error(real, shaded))
+
+    # Calculate Energy (Watt-hours)
+    d_real_wh = real.sum() * (5/60)  # Convert from W to Wh
+    d_base_wh = base.sum() * (5/60)
+    d_shaded_wh = shaded.sum() * (5/60)
+
+    return {
+        'RMSE_Base': rmse_b,
+        'RMSE_Shaded': rmse_s,
+        'Real_Wh': d_real_wh,
+        'Base_Wh': d_base_wh,
+        'Shaded_Wh': d_shaded_wh
+    }
+
 
 def evaluate_performance(significant_days_df, shadow_matrix_df, excel_df):
     daily_stats = []
@@ -286,7 +351,7 @@ def evaluate_performance(significant_days_df, shadow_matrix_df, excel_df):
         # 1. Get cleaned data from your optimized function
         # This handles shifts (0/1h for inv, 2/3h for fc) and NaN filling
         day_data, forecast_base, forecast_shaded = pv_analysis(
-            formatted_date, shadow_matrix_df, excel_df, window_size=20, plot=False
+            formatted_date, shadow_matrix_df, excel_df, window_size=(5, 3), plot=False
         )
         
         # 2. Reindex to 24h range to ensure exact matching for RMSE
@@ -343,4 +408,3 @@ def evaluate_performance(significant_days_df, shadow_matrix_df, excel_df):
     }
 
     return results_df, metrics
-
