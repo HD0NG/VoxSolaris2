@@ -137,7 +137,7 @@ def _open_las_any(path, prefer="auto"):
         )
     return laspy.open(path)
 
-def plot_shadow_matrix_with_sunpaths(matrix_path, lat=62.9798, lon=27.6486):
+def plot_shadow_matrix_with_sunpaths(matrix_path, lat=62.9798, lon=27.6486, fill_missing=True):
     print("Loading shadow matrix...")
     df = pd.read_csv(matrix_path, index_col=0)
 
@@ -187,10 +187,14 @@ def plot_shadow_matrix_with_sunpaths(matrix_path, lat=62.9798, lon=27.6486):
     max_el_fill = np.interp(theta_fill_deg, daylight_summer['azimuth'].values, daylight_summer['elevation'].values, left=0, right=0) + 2.0
     r_fill = 90 - max_el_fill # Convert elevation boundary to Zenith radius
     
+    if fill_missing:
     # Fill from the center (0) out to the r_fill boundary
-    ax.fill_between(theta_fill_rad, 0, r_fill, 
-                    color='white', edgecolor='#BFC6C4', hatch='/', 
-                    alpha=1.0, label='Uncomputed Zone (Outside Sun Path)')
+        ax.fill_between(theta_fill_rad, 0, r_fill, 
+                        color='white', edgecolor='#BFC6C4', hatch='/', 
+                        alpha=1.0, label='Uncomputed Zone (Outside Sun Path)')
+    # else:
+        # Just draw the boundary line for the uncomputed zone
+        # ax.plot(theta_fill_rad, r_fill, color='#BFC6C4', linestyle='--', label='Sun Path Boundary (+2° Buffer)')
 
     # Plot the sun paths
     ax.plot(np.radians(daylight_summer['azimuth']), daylight_summer['apparent_zenith'], 
