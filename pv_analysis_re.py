@@ -74,6 +74,12 @@ class SiteConfig:
     albedo_transition_center_c: float = 1.0
     albedo_transition_width_c: float = 3.0
 
+    # Empirical forecast time shift (minutes, positive = shift forecast later).
+    # Compensates for the spatial offset between the FMI weather station
+    # and the actual PV site (~10+ km apart), which causes irradiance
+    # patterns to arrive at slightly different times.
+    forecast_shift_minutes: float = 0.0
+
     @property
     def tz(self) -> pytz.BaseTzInfo:
         return pytz.timezone(self.local_tz)
@@ -293,6 +299,7 @@ def load_inverter_data(
     excel_path: Union[str, Path],
     expected_interval_min: float = 5.0,
     tolerance_min: float = 1.0,
+    center_timestamps: bool = False,
 ) -> pd.DataFrame:
     """
     Load Fronius inverter energy data and convert Wh -> W.
@@ -306,6 +313,16 @@ def load_inverter_data(
       - Uses actual time deltas for Wh -> W
       - Caps unreasonable power spikes from tiny gaps
       - Reports gap statistics
+
+    Parameters
+    ----------
+    center_timestamps : bool
+        If True (default), shift timestamps back by half the interval
+        (2.5 min for 5-min data). The Fronius logger timestamps the
+        END of the accumulation period, but the average power was
+        generated during the interval, centered 2.5 min earlier.
+        This corrects the ~2.5-minute latency between forecast
+        (instantaneous solar position) and measured energy.
     """
     df = pd.read_excel(excel_path, usecols=[0, 2], skiprows=[0, 1], header=None)
     df.columns = ["Timestamp", "Energy_Wh"]
@@ -353,6 +370,13 @@ def load_inverter_data(
         df["Power_W"] = df["Energy_Wh"] * (60.0 / expected_interval_min)
 
     df["Power_W"] = df["Power_W"].fillna(0.0)
+
+    # Center timestamps: shift back by half the interval
+    if center_timestamps:
+        half_interval = timedelta(minutes=expected_interval_min / 2.0)
+        df["Timestamp"] = df["Timestamp"] - half_interval
+        print(f"  Timestamps centered: shifted back by {expected_interval_min/2:.1f} min")
+
     return df
 
 
@@ -563,6 +587,16 @@ def pv_analysis(
         forecast_base, shadow_matrix, cfg=cfg, solpos=solpos
     )
 
+    # --- Empirical forecast time shift ---
+    # Compensates for FMI station being spatially offset from PV site.
+    # Applied BEFORE UTC→local to preserve 5-min grid alignment.
+    # Rounds to nearest interval to keep timestamps on-grid.
+    if cfg.forecast_shift_minutes != 0.0:
+        n_periods = round(cfg.forecast_shift_minutes / cfg.interval_minutes)
+        actual_shift = timedelta(minutes=n_periods * cfg.interval_minutes)
+        forecast_base.index = forecast_base.index + actual_shift
+        forecast_windowed.index = forecast_windowed.index + actual_shift
+
     # --- Shift forecasts UTC -> local ---
     forecast_base = _shift_index_to_local(forecast_base, target_date_obj, cfg.tz)
     forecast_windowed = _shift_index_to_local(forecast_windowed, target_date_obj, cfg.tz)
@@ -706,17 +740,25 @@ def evaluate_performance(
     excel_df: pd.DataFrame,
     extra_data_loader: Callable,
     cfg: SiteConfig = DEFAULT_CFG,
-) -> Tuple[pd.DataFrame, list, list]:
+) -> Tuple[pd.DataFrame, list, list, list]:
     """
     Evaluate over all clear days.
 
     Parameters
     ----------
     extra_data_loader : callable(date) -> DataFrame or None
+
+    Returns
+    -------
+    results_df : DataFrame with per-day metrics
+    all_real_power : list of real power values (all days concatenated)
+    all_pred_shaded : list of shadow-corrected predictions
+    all_pred_base : list of base (no-shadow) predictions
     """
     daily_stats = []
     all_real_power = []
-    all_pred_power = []
+    all_pred_shaded = []
+    all_pred_base = []
 
     for date_obj in tqdm.tqdm(
         significant_days_df["Date"].tolist(), desc="Evaluating"
@@ -731,7 +773,8 @@ def evaluate_performance(
         metrics = compute_metrics(day_data, fb, fw, cfg.interval_minutes)
 
         all_real_power.extend(day_data["Power_W"].fillna(0.0).values)
-        all_pred_power.extend(fw["output_shaded"].fillna(0.0).values)
+        all_pred_shaded.extend(fw["output_shaded"].fillna(0.0).values)
+        all_pred_base.extend(fb["output"].fillna(0.0).values)
 
         daily_stats.append({
             "Date": (date_obj.strftime("%Y-%m-%d")
@@ -742,14 +785,19 @@ def evaluate_performance(
     results_df = pd.DataFrame(daily_stats)
 
     if not results_df.empty:
-        print("\nGenerating scatter plot...")
+        print("\nGenerating scatter plots...")
         plot_real_vs_predicted_scatter(
-            all_real_power, all_pred_power,
-            title="Real vs. Shaded Forecast (All Clear Days)",
+            all_real_power, all_pred_base,
+            title="Real vs. FMI Base Forecast (All Clear Days)",
+            ylabel="FMI Forecast — No Shadows (W)",
+        )
+        plot_real_vs_predicted_scatter(
+            all_real_power, all_pred_shaded,
+            title="Real vs. Shadow-Corrected Forecast (All Clear Days)",
             ylabel="Shadow-Corrected Forecast (W)",
         )
 
-    return results_df, all_real_power, all_pred_power
+    return results_df, all_real_power, all_pred_shaded, all_pred_base
 
 
 # ============================================================================

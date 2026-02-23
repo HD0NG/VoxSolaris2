@@ -38,7 +38,7 @@ OMEGA_S = 0.56
 
 TARGET_COORDS_2D = np.array([532882.50, 6983507.00])
 ROOF_SEARCH_RADIUS = 2.0
-OFFSET_FROM_ROOF = 0.5
+OFFSET_FROM_ROOF = -2.5
 
 GROUND_CLASS = 2
 BUILDING_CLASS = 6
@@ -635,6 +635,13 @@ def create_shadow_matrix(
         row_configuration=(5, 4, 3)
     )
 
+    optical_center = compute_optical_center(
+        array_corner, tilt_deg=12, az_deg=170,
+        panel_width_m=1.0, panel_height_m=1.6,
+        row_configuration=(5, 4, 3)
+    )
+    print(f"\nPV array optical center at: {optical_center}")
+
     # --- Pre-compute cone offsets (reused for every direction) ---
     cone_offsets = precompute_cone_offsets(NUM_RAYS_PER_CONE)
     solar_radius_rad = np.deg2rad(SOLAR_ANGULAR_RADIUS_DEG)
@@ -645,7 +652,7 @@ def create_shadow_matrix(
     # Skip distance for self-occlusion: must clear the building the panels
     # sit on. Use 1.5 × voxel_size to ensure we skip through the roof voxel
     # and its immediate neighbors.
-    skip_dist = 1.5 * voxel_size
+    skip_dist = 5.5 * voxel_size
     print(f"\n  Self-occlusion skip distance: {skip_dist:.1f}m "
           f"(voxel_size={voxel_size}m)")
 
