@@ -38,7 +38,7 @@ OMEGA_S = 0.56
 
 TARGET_COORDS_2D = np.array([532882.50, 6983507.00])
 ROOF_SEARCH_RADIUS = 2.0
-OFFSET_FROM_ROOF = 1.5
+OFFSET_FROM_ROOF = 0.5
 
 GROUND_CLASS = 2
 BUILDING_CLASS = 6
@@ -328,6 +328,50 @@ def generate_pv_array_points(
     return world_points
 
 
+def compute_optical_center(
+    corner_coords, tilt_deg=12, az_deg=170,
+    panel_width_m=1.0, panel_height_m=1.6,
+    row_configuration=(5, 4, 3)
+):
+    """
+    Compute the irradiance-weighted optical center of the PV array.
+
+    The optical center is the area-weighted centroid of all panel positions,
+    where each panel's weight is proportional to cos(tilt) — i.e. its
+    projected area normal to the sky hemisphere. For a uniform tilt this
+    reduces to the simple geometric centroid of the panel centers.
+
+    This is useful for single-point shading lookups, sensor placement,
+    or converting between corner-anchored and center-anchored representations.
+
+    Parameters
+    ----------
+    corner_coords : array-like, shape (3,)
+        World coordinates (x, y, z) of the left corner anchor.
+    tilt_deg, az_deg, panel_width_m, panel_height_m, row_configuration :
+        Same as generate_pv_array_points.
+
+    Returns
+    -------
+    optical_center : np.ndarray, shape (3,)
+        World coordinates of the optical center.
+    """
+    panel_points = generate_pv_array_points(
+        corner_coords,
+        tilt_deg=tilt_deg,
+        az_deg=az_deg,
+        panel_width_m=panel_width_m,
+        panel_height_m=panel_height_m,
+        row_configuration=row_configuration,
+    )
+
+    # For a uniform-tilt array every panel has the same projected area,
+    # so the optical center is the arithmetic mean of panel centers.
+    # If panels had varying tilts, weight by cos(tilt_i) here.
+    optical_center = np.mean(panel_points, axis=0)
+
+    return optical_center
+
 
 # ============================================================================
 # CONE / SOLAR DISK SAMPLING (pre-computed, normalized)
@@ -391,7 +435,8 @@ def calculate_ray_transmittance(
     grid_dims, class_grid, dens_grid,
     k_base, g_class, b_class,
     origin_ix, origin_iy, origin_iz,
-    buffer_dist=0.1
+    buffer_dist=0.1,
+    skip_dist=0.0,
 ):
     """
     Trace a single ray through the voxel grid using 3D-DDA.
@@ -407,6 +452,10 @@ def calculate_ray_transmittance(
     origin_ix, origin_iy, origin_iz : int
         Voxel indices of the ray origin BEFORE buffer offset, used for
         robust self-occlusion avoidance.
+    skip_dist : float
+        Distance from origin within which building/ground voxels are
+        ignored (self-occlusion avoidance). Should be >= voxel_size
+        to ensure the ray clears the building the panels sit on.
     """
     # Zenith angle of this ray (angle from vertical = z-axis)
     cos_zenith = abs(direction[2])  # |cos(θ_z)|
@@ -457,9 +506,16 @@ def calculate_ray_transmittance(
 
         # Solid occlusion (ground / building)
         if v_class == b_class or v_class == g_class:
-            # Use pre-buffer origin voxel for self-occlusion check
-            if ix == origin_ix and iy == origin_iy and iz == origin_iz:
-                pass  # skip origin voxel
+            # Skip building/ground voxels within skip_dist of origin
+            # This prevents the building the PV array is mounted on
+            # from blocking the ray. Use Chebyshev distance in voxel
+            # coords (fast) combined with ray distance (accurate).
+            dx = abs(ix - origin_ix)
+            dy = abs(iy - origin_iy)
+            dz = abs(iz - origin_iz)
+            # current_t is the distance traveled along the ray so far
+            if (dx <= 1 and dy <= 1 and dz <= 1) or (current_t + buffer_dist < skip_dist):
+                pass  # skip — within safe zone of origin building
             else:
                 return 0.0
 
@@ -499,7 +555,7 @@ def calculate_ray_transmittance(
 def trace_batch(
     array_points, directions, scene_min, voxel_size,
     grid_dims, class_grid, dens_grid, k_base,
-    g_class, b_class, buffer_dist
+    g_class, b_class, buffer_dist, skip_dist
 ):
     """
     Trace all (panel_point × cone_ray) combinations for a SINGLE solar
@@ -528,7 +584,7 @@ def trace_batch(
                 class_grid, dens_grid, k_base,
                 g_class, b_class,
                 o_ix, o_iy, o_iz,
-                buffer_dist
+                buffer_dist, skip_dist
             )
         panel_means[p] = acc / n_cone
 
@@ -538,51 +594,6 @@ def trace_batch(
 # ============================================================================
 # MODULE 4: SIMULATION ORCHESTRATION
 # ============================================================================
-
-def compute_optical_center(
-    corner_coords, tilt_deg=12, az_deg=170,
-    panel_width_m=1.0, panel_height_m=1.6,
-    row_configuration=(5, 4, 3)
-):
-    """
-    Compute the irradiance-weighted optical center of the PV array.
-
-    The optical center is the area-weighted centroid of all panel positions,
-    where each panel's weight is proportional to cos(tilt) — i.e. its
-    projected area normal to the sky hemisphere. For a uniform tilt this
-    reduces to the simple geometric centroid of the panel centers.
-
-    This is useful for single-point shading lookups, sensor placement,
-    or converting between corner-anchored and center-anchored representations.
-
-    Parameters
-    ----------
-    corner_coords : array-like, shape (3,)
-        World coordinates (x, y, z) of the left corner anchor.
-    tilt_deg, az_deg, panel_width_m, panel_height_m, row_configuration :
-        Same as generate_pv_array_points.
-
-    Returns
-    -------
-    optical_center : np.ndarray, shape (3,)
-        World coordinates of the optical center.
-    """
-    panel_points = generate_pv_array_points(
-        corner_coords,
-        tilt_deg=tilt_deg,
-        az_deg=az_deg,
-        panel_width_m=panel_width_m,
-        panel_height_m=panel_height_m,
-        row_configuration=row_configuration,
-    )
-
-    # For a uniform-tilt array every panel has the same projected area,
-    # so the optical center is the arithmetic mean of panel centers.
-    # If panels had varying tilts, weight by cos(tilt_i) here.
-    optical_center = np.mean(panel_points, axis=0)
-
-    return optical_center
-
 
 def create_shadow_matrix(
     lidar_file_path=None, voxel_size=1.0,
@@ -618,16 +629,6 @@ def create_shadow_matrix(
     array_corner = np.array([
         TARGET_COORDS_2D[0], TARGET_COORDS_2D[1], target_z
     ])
-
-    center = compute_optical_center(
-        corner_coords=array_corner,
-        tilt_deg=12, az_deg=170,
-        panel_width_m=1.0, panel_height_m=1.6,
-        row_configuration=(5, 4, 3)
-    )
-    # print center with 2 decimal places for readability
-    print(f"  PV array optical center at: ({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f})")
-
     array_points = generate_pv_array_points(
         array_corner, tilt_deg=12, az_deg=170,
         panel_width_m=1.0, panel_height_m=1.6,
@@ -640,6 +641,13 @@ def create_shadow_matrix(
 
     # Extinction coefficient: k_base only — no Ω scaling (LAI_e already effective)
     k_base = K_BASE_FINLAND
+
+    # Skip distance for self-occlusion: must clear the building the panels
+    # sit on. Use 1.5 × voxel_size to ensure we skip through the roof voxel
+    # and its immediate neighbors.
+    skip_dist = 1.5 * voxel_size
+    print(f"\n  Self-occlusion skip distance: {skip_dist:.1f}m "
+          f"(voxel_size={voxel_size}m)")
 
     # --- Build task list ---
     elevations_rad = np.linspace(0, np.pi / 2, ELEVATION_STEPS, endpoint=True)
@@ -659,7 +667,7 @@ def create_shadow_matrix(
     _ = trace_batch(
         array_points_c, _warmup_dirs, scene_min_c, voxel_size,
         grid_dims_c, class_grid_c, dens_grid_c, k_base,
-        GROUND_CLASS, BUILDING_CLASS, buf_dist
+        GROUND_CLASS, BUILDING_CLASS, buf_dist, skip_dist
     )
 
     total_tasks = ELEVATION_STEPS * AZIMUTH_STEPS
@@ -670,12 +678,6 @@ def create_shadow_matrix(
           f"= {len(array_points) * NUM_RAYS_PER_CONE} traces per direction")
 
     # --- Main computation loop ---
-    # We iterate over elevations (outer) and azimuths (inner).
-    # For elevation = 0 (horizontal) transmittance is set to 0 (below horizon).
-    # For high elevations with minimal canopy overhead, transmittance → 1.
-    # Numba prange handles panel-level parallelism inside trace_batch;
-    # we avoid joblib to eliminate per-task grid serialization overhead.
-
     results_transmittance = np.zeros((ELEVATION_STEPS, AZIMUTH_STEPS), dtype=np.float64)
     completed = 0
 
@@ -683,14 +685,9 @@ def create_shadow_matrix(
         el_deg = np.rad2deg(el)
 
         if el < 0.001:
-            # Below/at horizon — no direct sun
             results_transmittance[ei, :] = 0.0
             completed += AZIMUTH_STEPS
             continue
-
-        # If the sun is very high (>55°), canopy occlusion for a rooftop PV
-        # is negligible for most boreal scenes.  We still compute but could
-        # short-circuit here if profiling shows it's worthwhile.
 
         center_dirs = np.empty((AZIMUTH_STEPS, 3), dtype=np.float64)
         center_dirs[:, 0] = np.cos(el) * np.sin(azimuths_rad)
@@ -704,7 +701,7 @@ def create_shadow_matrix(
             t = trace_batch(
                 array_points_c, cone_dirs, scene_min_c, voxel_size,
                 grid_dims_c, class_grid_c, dens_grid_c, k_base,
-                GROUND_CLASS, BUILDING_CLASS, buf_dist
+                GROUND_CLASS, BUILDING_CLASS, buf_dist, skip_dist
             )
             results_transmittance[ei, ai] = t
 
@@ -747,11 +744,11 @@ def create_shadow_matrix(
 if __name__ == "__main__":
     LIDAR_FILE_PATH = "output/reclassified_final_v5.laz"
     OUTPUT_DIRECTORY = "results/shadow_matrix_results_SE_pro"
-    OUTPUT_FILENAME = "shadow_attenuation_matrix_conecasting_SE_v1.csv"
+    OUTPUT_FILENAME = "shadow_attenuation_matrix_conecasting_SE_v2.csv"
 
     create_shadow_matrix(
         lidar_file_path=LIDAR_FILE_PATH,
-        voxel_size=1.0,
+        voxel_size=2.0,
         output_dir=OUTPUT_DIRECTORY,
         output_fn=OUTPUT_FILENAME,
     )
