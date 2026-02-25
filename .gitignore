@@ -8,6 +8,8 @@ output/
 results/
 # achived folder
 archive/
+# htmls
+.html
 
 # Jupyter Notebook checkpoints and others
 .ipynb
