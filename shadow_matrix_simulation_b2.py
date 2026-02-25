@@ -1,29 +1,39 @@
 """
-Voxel-Based Ray-Tracing Shadow Matrix Generator — BANK 1 (SE, 170°)
-====================================================================
-Uses LiDAR point clouds and the Beer-Lambert model to simulate light
-interception in plant canopies via 3D-DDA voxel traversal.
+Voxel-Based Ray-Tracing Shadow Matrix Generator — BANK 2 (West, 260°)
+======================================================================
+Based on shadow_matrix_simulation_re.py (skip_dist version).
 
 Roof geometry (annotated aerial image):
   The building has two roof sections separated by a hinge line running
   approximately NW–SE.
 
-  BANK 1 — SE-facing (this script)
+  BANK 1 — SE-facing (separate script)
     Azimuth: 170°   Tilt: 12°   Panels: 12   Nominal: 3 960 W
     Layout: (5, 4, 3) left-aligned
-    Anchor corner: (532881.51, 6983506.91) — panel 1-10 at (532882.00, 6983507.00)
-    Inverter channel: MPP1
+    Panels: 1-1…1-5 (top), 1-6…1-9 (mid), 1-10…1-12 (bot)
 
-    Panel numbering (left→right per row, top row first):
-      Row 0 (top):  1-1   1-2   1-3   1-4   1-5
-      Row 1 (mid):  1-6   1-7   1-8   1-9
-      Row 2 (bot):  1-10  1-11  1-12
-
-  BANK 2 — West-facing (separate script)
+  BANK 2 — West-facing (this script)
     Azimuth: 260°   Tilt: 20°   Panels: 14   Nominal: 4 620 W
     Inverter channel: MPP2
-    Part 1 — North (6, 2) left-aligned:  2-1-1 … 2-1-8
-    Part 2 — South (4, 2) right-aligned: 2-2-1 … 2-2-6
+
+    Part 1 — North sub-array (8 panels)
+      Layout: (6, 2) left-aligned
+      Anchor corner: (532882.93, 6983518.73) — panel 2-1-1 at (532884.50, 6983518.50)
+      Row 0: 2-1-1  2-1-2  2-1-3  2-1-4  2-1-5  2-1-6
+      Row 1: 2-1-7  2-1-8
+
+    Part 2 — South sub-array (6 panels)
+      Layout: (4, 2) right-aligned
+      Anchor corner: (532888.63, 6983503.79) — panel 2-2-1 at (532889.50, 6983507.50)
+      Row 0: 2-2-1  2-2-2  2-2-3  2-2-4
+      Row 1: 2-2-5  2-2-6
+
+    Note: at 260° azimuth, local +x maps to ≈ north, so "rows" in the
+    code appear as vertical columns in the aerial view.
+
+Two separate shadow matrices are generated (scene loaded once):
+  - ..._W_north_v1.csv  (panels 2-1-1 … 2-1-8)
+  - ..._W_south_v1.csv  (panels 2-2-1 … 2-2-6)
 """
 
 import os
@@ -33,22 +43,19 @@ import laspy
 import numpy as np
 import pandas as pd
 from numba import njit, prange
-from multiprocessing import shared_memory
 
 # ============================================================================
 # CONFIGURATION (Boreal Calibration)
 # ============================================================================
 
 BETA_FINLAND = 2.08
-# K_BASE is the base extinction coefficient derived from β.
-# Since column_lai_e = -β * ln(P_gap) already yields EFFECTIVE LAI
-# (clumping is embedded in the gap-fraction measurement), we do NOT
-# multiply k by Ω again.  Ω is only needed if converting LAI_e → LAI_true.
 K_BASE_FINLAND = 1.0 / BETA_FINLAND  # ≈ 0.481
-# OMEGA_S is retained for reference but NOT used to scale k.
-OMEGA_S = 0.56
+OMEGA_S = 0.56  # retained for reference, NOT used
 
-TARGET_COORDS_2D = np.array([532881.51, 6983506.91])  # Bank 1 corner — derived from panel 1-10 at (532882.00, 6983507.00)
+# --- Bank 2 sub-array corners ---
+NORTH_CORNER_2D = np.array([532882.93, 6983518.73])  # Part 1 corner — derived from panel 2-1-1 at (532884.50, 6983518.50)
+SOUTH_CORNER_2D = np.array([532888.63, 6983503.79])  # Part 2 corner — derived from panel 2-2-1 at (532889.50, 6983507.50)
+
 ROOF_SEARCH_RADIUS = 3.0
 OFFSET_FROM_ROOF = -0.5
 SKIP_DISTANCE = 3.0  # meters to skip building/ground voxels near origin
@@ -62,7 +69,6 @@ CLASS_PRIORITY = {6: 5, 5: 4, 4: 3, 3: 2, 2: 1, 0: 0}
 AZIMUTH_STEPS = 360
 ELEVATION_STEPS = 91
 SOLAR_ANGULAR_RADIUS_DEG = 0.265
-# Reduced from 16 — for a 0.265° disk, 6 rays suffice with Fibonacci sampling
 NUM_RAYS_PER_CONE = 6
 
 
@@ -97,36 +103,23 @@ def voxelize_scene(points, classifications, voxel_size, beta=BETA_FINLAND):
     """
     Build class_grid (int8) and dens_grid (float32, leaf-area density m²/m³)
     from a classified point cloud.
-
-    The density derivation follows:
-      1. Per-column gap fraction  P_gap = ground_returns / total_returns
-      2. Effective LAI             LAI_e = -β · ln(P_gap)
-      3. Vertical distribution     LAD_voxel = (frac_veg_in_voxel) · LAI_e / Δz
-
-    Because LAI_e already embeds the clumping index Ω, no further Ω scaling
-    is applied to the extinction coefficient downstream.
     """
     scene_min = np.min(points, axis=0)
     scene_max = np.max(points, axis=0)
     grid_dims = np.ceil((scene_max - scene_min) / voxel_size).astype(np.int32)
-    # Ensure at least 1 voxel per dimension
     grid_dims = np.maximum(grid_dims, 1)
     nx, ny, nz = grid_dims
 
-    # --- Vectorized voxel index computation ---
     voxel_indices = np.clip(
         np.floor((points - scene_min) / voxel_size).astype(np.int32),
         0, grid_dims - 1
     )
     vi_x, vi_y, vi_z = voxel_indices[:, 0], voxel_indices[:, 1], voxel_indices[:, 2]
 
-    # --- Class grid (priority-based) using vectorized approach ---
-    # Numba-accelerated priority assignment
     class_grid = _assign_class_priority(
         vi_x, vi_y, vi_z, classifications, nx, ny, nz
     )
 
-    # --- 2D column counts (vectorized with np.add.at) ---
     ground_mask = classifications == GROUND_CLASS
     veg_mask = (classifications == 3) | (classifications == 4) | (classifications == 5)
 
@@ -134,10 +127,8 @@ def voxelize_scene(points, classifications, voxel_size, beta=BETA_FINLAND):
 
     total_counts = np.zeros(nx * ny, dtype=np.int32)
     np.add.at(total_counts, flat_2d, 1)
-
     ground_counts = np.zeros(nx * ny, dtype=np.int32)
     np.add.at(ground_counts, flat_2d[ground_mask], 1)
-
     veg_counts_2d = np.zeros(nx * ny, dtype=np.int32)
     np.add.at(veg_counts_2d, flat_2d[veg_mask], 1)
 
@@ -145,8 +136,6 @@ def voxelize_scene(points, classifications, voxel_size, beta=BETA_FINLAND):
     ground_counts = ground_counts.reshape(nx, ny)
     veg_counts_2d = veg_counts_2d.reshape(nx, ny)
 
-    # --- 3D vegetation point counts (vectorized) ---
-    dens_grid = np.zeros((nx, ny, nz), dtype=np.float32)
     flat_3d_veg = (
         vi_x[veg_mask].astype(np.int64) * ny * nz
         + vi_y[veg_mask].astype(np.int64) * nz
@@ -156,24 +145,20 @@ def voxelize_scene(points, classifications, voxel_size, beta=BETA_FINLAND):
     np.add.at(veg_counts_3d, flat_3d_veg, 1.0)
     dens_grid = veg_counts_3d.reshape(nx, ny, nz)
 
-    # --- API → effective LAI → leaf area density (LAD) ---
     api_grid = np.ones((nx, ny), dtype=np.float32)
     valid = total_counts > 0
     api_grid[valid] = ground_counts[valid] / total_counts[valid]
     api_grid = np.clip(api_grid, 0.01, 1.0)
     column_lai_e = -beta * np.log(api_grid)
 
-    # Distribute column LAI_e vertically by vegetation fraction
     safe_veg = np.where(veg_counts_2d > 0, veg_counts_2d, 1).astype(np.float32)
     for iz_idx in range(nz):
         dens_grid[:, :, iz_idx] = (
             (dens_grid[:, :, iz_idx] / safe_veg) * (column_lai_e / voxel_size)
         )
-    # Zero out columns with no vegetation points
     no_veg = veg_counts_2d == 0
     dens_grid[no_veg, :] = 0.0
 
-    # --- Vectorized ground/building infill ---
     _fill_below_surface(class_grid, GROUND_CLASS, CLASS_PRIORITY)
     _fill_below_surface(class_grid, BUILDING_CLASS, CLASS_PRIORITY)
 
@@ -183,15 +168,11 @@ def voxelize_scene(points, classifications, voxel_size, beta=BETA_FINLAND):
 
 @njit
 def _assign_class_priority(vi_x, vi_y, vi_z, classifications, nx, ny, nz):
-    """Assign voxel classes respecting a priority order (Numba-accelerated)."""
     class_grid = np.zeros((nx, ny, nz), dtype=np.int8)
-    # Inline priority lookup (avoid dict in njit)
-    # {6:5, 5:4, 4:3, 3:2, 2:1, 0:0}
     for i in range(len(vi_x)):
         ix, iy, iz = vi_x[i], vi_y[i], vi_z[i]
         c = classifications[i]
         existing = class_grid[ix, iy, iz]
-        # Priority function inlined
         p_new = _class_priority(c)
         p_old = _class_priority(existing)
         if p_new > p_old:
@@ -201,39 +182,22 @@ def _assign_class_priority(vi_x, vi_y, vi_z, classifications, nx, ny, nz):
 
 @njit
 def _class_priority(c):
-    """Return priority for a classification code."""
-    if c == 6:
-        return 5
-    elif c == 5:
-        return 4
-    elif c == 4:
-        return 3
-    elif c == 3:
-        return 2
-    elif c == 2:
-        return 1
-    else:
-        return 0
+    if c == 6: return 5
+    elif c == 5: return 4
+    elif c == 4: return 3
+    elif c == 3: return 2
+    elif c == 2: return 1
+    else: return 0
 
 
 def _fill_below_surface(class_grid, fill_class, priority_map):
-    """
-    For each column, find the highest voxel of fill_class and fill everything
-    below it (vectorized per-column rather than per-voxel Python loop).
-    """
     nx, ny, nz = class_grid.shape
     fill_priority = priority_map[fill_class]
-
-    # Mask of voxels matching fill_class
-    match = class_grid == fill_class  # (nx, ny, nz)
-
-    # For each column, find the highest z with this class (-1 if absent)
-    # Work with z-indices: build array of z-values where match is True, else -1
-    z_indices = np.arange(nz)[np.newaxis, np.newaxis, :]  # (1, 1, nz)
+    match = class_grid == fill_class
+    z_indices = np.arange(nz)[np.newaxis, np.newaxis, :]
     z_where_match = np.where(match, z_indices, -1)
-    max_z = np.max(z_where_match, axis=2)  # (nx, ny)
+    max_z = np.max(z_where_match, axis=2)
 
-    # For columns that have at least one match
     cols = np.argwhere(max_z >= 0)
     for idx in range(len(cols)):
         ix, iy = cols[idx, 0], cols[idx, 1]
@@ -247,7 +211,6 @@ def _fill_below_surface(class_grid, fill_class, priority_map):
 
 
 def _class_priority_py(c):
-    """Pure-Python priority lookup (for use outside Numba)."""
     return {6: 5, 5: 4, 4: 3, 3: 2, 2: 1}.get(c, 0)
 
 
@@ -256,68 +219,46 @@ def _class_priority_py(c):
 # ============================================================================
 
 def generate_pv_array_points(
-    corner_coords, tilt_deg=12, az_deg=170,
+    corner_coords, tilt_deg=20, az_deg=260,
     panel_width_m=1.0, panel_height_m=1.6,
-    row_configuration=(5, 4, 3)
+    row_configuration=(6, 2),
+    align="left",
 ):
     """
-    Generate world-coordinate panel center points for a rooftop PV array,
-    anchored from the LEFT CORNER of the array.
-
-    The left corner is defined as the bottom-left of the widest (first) row
-    in local coordinates before rotation. Panels extend:
-      - rightward (+x local) across each row
-      - upward (+y local) across rows
-
-    After construction, the local grid is rotated by tilt and azimuth,
-    then translated so the left corner lands on corner_coords.
+    Generate world-coordinate panel center points for a rooftop PV array.
 
     Parameters
     ----------
     corner_coords : array-like, shape (3,)
-        World coordinates (x, y, z) of the left corner anchor point.
-    tilt_deg : float
-        Panel tilt angle in degrees.
-    az_deg : float
-        Panel azimuth in degrees (compass convention, 180 = south).
-    panel_width_m : float
-        Width of each panel in meters.
-    panel_height_m : float
-        Height (depth) of each panel row in meters.
-    row_configuration : tuple of int
-        Number of panels per row, top-to-bottom (e.g., (5, 4, 3)).
-
-    Returns
-    -------
-    np.ndarray, shape (n_panels, 3)
-        World-coordinate panel center points.
+        World coordinates of the anchor corner.
+    align : str
+        'left'  — panels extend rightward from anchor (left corner).
+        'right' — panels extend leftward from anchor (right corner).
     """
     tilt_rad = np.radians(tilt_deg)
     rot_z_rad = np.radians(180 - az_deg)
 
     num_rows = len(row_configuration)
-    max_width = max(row_configuration) * panel_width_m
     total_height = (num_rows - 1) * panel_height_m
 
-    # Build local panel centers anchored at left corner = (0, 0)
-    # x: left-aligned, panels start at x = panel_width/2 (center of first panel)
-    # y: row 0 (top row) at y = total_height, last row at y = 0
     local_points = []
-    y_steps = np.linspace(total_height, 0.0, num_rows)  # top row → bottom row
+    y_steps = np.linspace(total_height, 0.0, num_rows)
 
     for i, num_panels in enumerate(row_configuration):
         y = y_steps[i]
+        row_width = num_panels * panel_width_m
+        if align == "right":
+            # Right-aligned: rightmost panel edge at x=0, panels extend left
+            x_start = -(row_width - panel_width_m / 2)
+        else:
+            # Left-aligned: leftmost panel edge at x=0
+            x_start = panel_width_m / 2
         for p in range(num_panels):
-            x = p * panel_width_m + panel_width_m / 2  # center of panel p
+            x = x_start + p * panel_width_m
             local_points.append([x, y, 0.0])
 
     local_points = np.array(local_points)
 
-    # The left corner in local space is (0, 0, 0).
-    # Panel centers are offset from it. After rotation, we translate
-    # so that the rotated left corner lands on corner_coords.
-
-    # Rotation matrices
     R_tilt = np.array([
         [1, 0, 0],
         [0, np.cos(tilt_rad), -np.sin(tilt_rad)],
@@ -330,84 +271,30 @@ def generate_pv_array_points(
     ])
 
     R_combined = R_az @ R_tilt
-
-    # Rotate local points
     rotated_points = (R_combined @ local_points.T).T
-
-    # The local origin (0,0,0) = left corner. After rotation it maps to (0,0,0)
-    # since R @ [0,0,0]^T = [0,0,0]^T. So we just translate by corner_coords.
     world_points = rotated_points + np.asarray(corner_coords)
 
     return world_points
 
 
-def compute_optical_center(
-    corner_coords, tilt_deg=12, az_deg=170,
-    panel_width_m=1.0, panel_height_m=1.6,
-    row_configuration=(5, 4, 3)
-):
-    """
-    Compute the irradiance-weighted optical center of the PV array.
-
-    The optical center is the area-weighted centroid of all panel positions,
-    where each panel's weight is proportional to cos(tilt) — i.e. its
-    projected area normal to the sky hemisphere. For a uniform tilt this
-    reduces to the simple geometric centroid of the panel centers.
-
-    This is useful for single-point shading lookups, sensor placement,
-    or converting between corner-anchored and center-anchored representations.
-
-    Parameters
-    ----------
-    corner_coords : array-like, shape (3,)
-        World coordinates (x, y, z) of the left corner anchor.
-    tilt_deg, az_deg, panel_width_m, panel_height_m, row_configuration :
-        Same as generate_pv_array_points.
-
-    Returns
-    -------
-    optical_center : np.ndarray, shape (3,)
-        World coordinates of the optical center.
-    """
-    panel_points = generate_pv_array_points(
-        corner_coords,
-        tilt_deg=tilt_deg,
-        az_deg=az_deg,
-        panel_width_m=panel_width_m,
-        panel_height_m=panel_height_m,
-        row_configuration=row_configuration,
-    )
-
-    # For a uniform-tilt array every panel has the same projected area,
-    # so the optical center is the arithmetic mean of panel centers.
-    # If panels had varying tilts, weight by cos(tilt_i) here.
-    optical_center = np.mean(panel_points, axis=0)
-
-    return optical_center
+def compute_optical_center(corner_coords, **kwargs):
+    """Compute the irradiance-weighted optical center of the PV array."""
+    panel_points = generate_pv_array_points(corner_coords, **kwargs)
+    return np.mean(panel_points, axis=0)
 
 
 # ============================================================================
-# CONE / SOLAR DISK SAMPLING (pre-computed, normalized)
+# CONE / SOLAR DISK SAMPLING
 # ============================================================================
 
 def precompute_cone_offsets(num_samples):
-    """
-    Build unit-disk offsets using a Fibonacci spiral.
-    Returns (num_samples, 2) array of (r·cos(φ), r·sin(φ)) values
-    in a unit disk that can be scaled by the angular radius.
-    """
     indices = np.arange(num_samples, dtype=np.float64)
     r = np.sqrt((indices + 0.5) / num_samples)
     phi = 2.0 * np.pi * 0.618034 * indices
-    return np.column_stack([r * np.cos(phi), r * np.sin(phi)])  # (N, 2)
+    return np.column_stack([r * np.cos(phi), r * np.sin(phi)])
 
 
 def build_cone_directions(center_dir, radius_rad, offsets_2d):
-    """
-    Given a center direction (unit vector), angular radius, and pre-computed
-    2D disk offsets, return an array of normalized ray directions.
-    """
-    # Construct local tangent basis (u, v) perpendicular to center_dir
     if np.abs(center_dir[2]) > 0.99:
         up = np.array([0.0, 1.0, 0.0])
     else:
@@ -415,17 +302,14 @@ def build_cone_directions(center_dir, radius_rad, offsets_2d):
     u = np.cross(up, center_dir)
     u /= np.linalg.norm(u)
     v = np.cross(center_dir, u)
-
-    # Perturbed directions: center + radius * (offset_x * u + offset_y * v)
     dirs = (
         center_dir[np.newaxis, :]
         + radius_rad * offsets_2d[:, 0:1] * u[np.newaxis, :]
         + radius_rad * offsets_2d[:, 1:2] * v[np.newaxis, :]
     )
-    # Normalize each direction
     norms = np.linalg.norm(dirs, axis=1, keepdims=True)
     dirs /= norms
-    return dirs  # (num_samples, 3)
+    return dirs
 
 
 # ============================================================================
@@ -434,11 +318,6 @@ def build_cone_directions(center_dir, radius_rad, offsets_2d):
 
 @njit(fastmath=True)
 def g_function_spherical(cos_zenith):
-    """
-    G(θ) projection function for a spherical leaf angle distribution.
-    G(θ) = 0.5 for all θ. Retained as a function for easy substitution
-    of other distributions (e.g., erectophile, planophile).
-    """
     return 0.5
 
 
@@ -454,24 +333,10 @@ def calculate_ray_transmittance(
     """
     Trace a single ray through the voxel grid using 3D-DDA.
 
-    Beer-Lambert attenuation per vegetation voxel:
-        T_voxel = exp( -k_base · G(θ) · LAD · path_length )
-
-    where k_base = 1/β (no additional Ω scaling since LAI_e already
-    includes clumping), and G(θ) depends on the ray's zenith angle.
-
-    Parameters
-    ----------
-    origin_ix, origin_iy, origin_iz : int
-        Voxel indices of the ray origin BEFORE buffer offset, used for
-        robust self-occlusion avoidance.
-    skip_dist : float
-        Distance from origin within which building/ground voxels are
-        ignored (self-occlusion avoidance). Should be >= voxel_size
-        to ensure the ray clears the building the panels sit on.
+    Self-occlusion avoidance: building/ground voxels within skip_dist
+    of the ray origin are ignored (Chebyshev + distance check).
     """
-    # Zenith angle of this ray (angle from vertical = z-axis)
-    cos_zenith = abs(direction[2])  # |cos(θ_z)|
+    cos_zenith = abs(direction[2])
     g_theta = g_function_spherical(cos_zenith)
 
     adj_origin = origin + direction * buffer_dist
@@ -481,7 +346,7 @@ def calculate_ray_transmittance(
     iz = int(math.floor(ray_pos[2]))
 
     if not (0 <= ix < grid_dims[0] and 0 <= iy < grid_dims[1] and 0 <= iz < grid_dims[2]):
-        return 1.0  # ray starts outside grid → open sky
+        return 1.0
 
     step_x = 1 if direction[0] >= 0 else -1
     step_y = 1 if direction[1] >= 0 else -1
@@ -515,18 +380,13 @@ def calculate_ray_transmittance(
         next_t = min(t_max_x, t_max_y, t_max_z)
         path_len = next_t - current_t
         if path_len < 0.0:
-            path_len = 0.0  # guard against floating-point edge case
+            path_len = 0.0
 
         # Solid occlusion (ground / building)
         if v_class == b_class or v_class == g_class:
-            # Skip building/ground voxels within skip_dist of origin
-            # This prevents the building the PV array is mounted on
-            # from blocking the ray. Use Chebyshev distance in voxel
-            # coords (fast) combined with ray distance (accurate).
             dx = abs(ix - origin_ix)
             dy = abs(iy - origin_iy)
             dz = abs(iz - origin_iz)
-            # current_t is the distance traveled along the ray so far
             if (dx <= 1 and dy <= 1 and dz <= 1) or (current_t + buffer_dist < skip_dist):
                 pass  # skip — within safe zone of origin building
             else:
@@ -561,7 +421,7 @@ def calculate_ray_transmittance(
 
 
 # ============================================================================
-# BATCH RAY TRACING (Numba parallel over panel × cone rays)
+# BATCH RAY TRACING
 # ============================================================================
 
 @njit(parallel=True, fastmath=True)
@@ -570,20 +430,13 @@ def trace_batch(
     grid_dims, class_grid, dens_grid, k_base,
     g_class, b_class, buffer_dist, skip_dist
 ):
-    """
-    Trace all (panel_point × cone_ray) combinations for a SINGLE solar
-    direction.  Returns the mean transmittance across panels.
-
-    directions : (n_cone, 3)  — cone ray directions for this solar position
-    array_points : (n_panels, 3)
-    """
+    """Trace all (panel × cone_ray) combinations. Returns mean transmittance."""
     n_panels = array_points.shape[0]
     n_cone = directions.shape[0]
     panel_means = np.empty(n_panels, dtype=np.float64)
 
     for p in prange(n_panels):
         origin = array_points[p]
-        # Compute origin voxel BEFORE buffer offset
         ov = (origin - scene_min) / voxel_size
         o_ix = int(math.floor(ov[0]))
         o_iy = int(math.floor(ov[1]))
@@ -608,94 +461,42 @@ def trace_batch(
 # MODULE 4: SIMULATION ORCHESTRATION
 # ============================================================================
 
-def create_shadow_matrix(
-    lidar_file_path=None, voxel_size=1.0,
-    output_dir=None, output_fn=None, buf_dist=0.1, skip_dist=SKIP_DISTANCE, offset_from_roof=OFFSET_FROM_ROOF
+def _find_roof_z(points, classifications, corner_xy, search_radius,
+                 offset_from_roof, scene_min_z):
+    """Find roof height near a corner and return panel Z."""
+    dists = np.linalg.norm(points[:, :2] - corner_xy, axis=1)
+    mask = dists < search_radius
+    roof_pts = points[mask & (classifications == BUILDING_CLASS)]
+    if len(roof_pts) > 0:
+        roof_max = np.max(roof_pts[:, 2])
+        target_z = roof_max + offset_from_roof
+        print(f"    Roof: {len(roof_pts)} pts, max_z={roof_max:.2f}m, "
+              f"offset={offset_from_roof:+.1f}m → panel_z={target_z:.2f}m")
+        return target_z
+    else:
+        print(f"    WARNING: no building points near corner, using scene min Z")
+        return scene_min_z
+
+
+def _run_hemispherical_sweep(
+    array_points, scene_min_c, voxel_size, grid_dims_c,
+    class_grid_c, dens_grid_c, k_base,
+    cone_offsets, solar_radius_rad,
+    buf_dist, skip_dist, label="",
 ):
     """
-    Build a full hemispherical shadow-attenuation matrix (elevation × azimuth).
-
-    The matrix stores shadow intensity = 1 − transmittance for each
-    discrete sky direction.
+    Run the full elevation × azimuth sweep for a set of panel points.
+    Returns a shadow-intensity DataFrame (91 × 361).
     """
-    start_time = time.time()
-
-    # --- Load & voxelize ---
-    points, classifications = load_and_prepare_lidar(
-        lidar_file_path, relevant_classes=RELEVANT_CLASSES
-    )
-
-    class_grid, dens_grid, scene_min, grid_dims = voxelize_scene(
-        points, classifications, voxel_size, BETA_FINLAND
-    )
-
-    # --- Determine PV array placement ---
-    dists = np.linalg.norm(points[:, :2] - TARGET_COORDS_2D, axis=1)
-    mask = dists < ROOF_SEARCH_RADIUS
-    roof_points = points[mask & (classifications == BUILDING_CLASS)]
-    if len(roof_points) > 0:
-        target_z = np.max(roof_points[:, 2]) + offset_from_roof
-        print(f"  Roof detection: {len(roof_points)} building pts within "
-              f"{ROOF_SEARCH_RADIUS}m, max_z={np.max(roof_points[:, 2]):.2f}m, "
-              f"panel_z={target_z:.2f}m")
-    else:
-        target_z = scene_min[2]
-        print("  WARNING: No building points found near target. Using scene min Z.")
-
-    array_corner = np.array([
-        TARGET_COORDS_2D[0], TARGET_COORDS_2D[1], target_z
-    ])
-    array_points = generate_pv_array_points(
-        array_corner, tilt_deg=12, az_deg=170,
-        panel_width_m=1.0, panel_height_m=1.6,
-        row_configuration=(5, 4, 3)
-    )
-    # Panel order: 1-1…1-5 (row 0), 1-6…1-9 (row 1), 1-10…1-12 (row 2)
-
-    # --- Pre-compute cone offsets (reused for every direction) ---
-    cone_offsets = precompute_cone_offsets(NUM_RAYS_PER_CONE)
-    solar_radius_rad = np.deg2rad(SOLAR_ANGULAR_RADIUS_DEG)
-
-    # Extinction coefficient: k_base only — no Ω scaling (LAI_e already effective)
-    k_base = K_BASE_FINLAND
-
-    # Skip distance for self-occlusion: must clear the building the panels
-    # sit on. With correct Z-placement (panels at actual height), we only
-    # need to skip the immediate building voxels. 1.5 × voxel_size is
-    # sufficient for the origin voxel and its direct neighbors.
-    # skip_dist = SKIP_DISTANCE
-    print(f"\n  Self-occlusion skip distance: {skip_dist:.1f}m "
-          f"(voxel_size={voxel_size}m)")
-
-    # --- Build task list ---
-    elevations_rad = np.linspace(0, np.pi / 2, ELEVATION_STEPS, endpoint=True)
-    azimuths_rad = np.linspace(0, 2 * np.pi, AZIMUTH_STEPS, endpoint=False)
-
-    # Ensure contiguous arrays for Numba
-    scene_min_c = np.ascontiguousarray(scene_min)
-    grid_dims_c = np.ascontiguousarray(grid_dims)
-    class_grid_c = np.ascontiguousarray(class_grid)
-    dens_grid_c = np.ascontiguousarray(dens_grid)
+    start = time.time()
     array_points_c = np.ascontiguousarray(array_points)
 
-    # Warm up Numba JIT (first call compiles; subsequent calls are fast)
-    print("\n--- JIT warm-up (first trace) ---")
-    _warmup_dir = np.array([0.0, 0.0, 1.0])
-    _warmup_dirs = build_cone_directions(_warmup_dir, solar_radius_rad, cone_offsets)
-    _ = trace_batch(
-        array_points_c, _warmup_dirs, scene_min_c, voxel_size,
-        grid_dims_c, class_grid_c, dens_grid_c, k_base,
-        GROUND_CLASS, BUILDING_CLASS, buf_dist, skip_dist
-    )
-
+    elevations_rad = np.linspace(0, np.pi / 2, ELEVATION_STEPS, endpoint=True)
+    azimuths_rad = np.linspace(0, 2 * np.pi, AZIMUTH_STEPS, endpoint=False)
     total_tasks = ELEVATION_STEPS * AZIMUTH_STEPS
-    print(f"\n--- Starting Hemispherical Cone-Casting Simulation ---")
-    print(f"  {ELEVATION_STEPS} elevations × {AZIMUTH_STEPS} azimuths = "
-          f"{total_tasks:,} directions")
-    print(f"  {len(array_points)} panel points × {NUM_RAYS_PER_CONE} cone rays "
-          f"= {len(array_points) * NUM_RAYS_PER_CONE} traces per direction")
 
-    # --- Main computation loop ---
+    print(f"\n--- Sweep: {label} ({len(array_points)} panels) ---")
+
     results_transmittance = np.zeros((ELEVATION_STEPS, AZIMUTH_STEPS), dtype=np.float64)
     completed = 0
 
@@ -726,33 +527,135 @@ def create_shadow_matrix(
         completed += AZIMUTH_STEPS
         if (ei + 1) % 10 == 0 or ei == ELEVATION_STEPS - 1:
             pct = 100.0 * completed / total_tasks
-            elapsed = time.time() - start_time
+            elapsed = time.time() - start
             print(f"  Elevation {el_deg:5.1f}° done  "
                   f"({completed:,}/{total_tasks:,} = {pct:.1f}%)  "
                   f"[{elapsed:.0f}s elapsed]")
 
-    # --- Assemble output DataFrame ---
-    shadow_matrix = 1.0 - results_transmittance  # shadow intensity
+    shadow_matrix = 1.0 - results_transmittance
 
     elev_labels = [f"Altitude_{i}" for i in range(ELEVATION_STEPS)]
     azim_labels = [f"Azimuth_{i}" for i in range(AZIMUTH_STEPS)]
-
     matrix_df = pd.DataFrame(shadow_matrix, index=elev_labels, columns=azim_labels)
-
-    # Wrap azimuth: duplicate column 0 as column 360 for interpolation
     matrix_df["Azimuth_360"] = matrix_df["Azimuth_0"]
+
+    elapsed = time.time() - start
+    print(f"  {label} completed in {elapsed:.1f}s")
+    return matrix_df
+
+
+def create_shadow_matrices(
+    lidar_file_path=None, voxel_size=2.0,
+    output_dir=None,
+    buf_dist=0.1, skip_dist=SKIP_DISTANCE,
+    offset_from_roof=OFFSET_FROM_ROOF,
+    file_name_suffix="v1",
+):
+    """
+    Build separate hemispherical shadow matrices for Bank 2 North and South.
+
+    Loads and voxelizes the LiDAR scene ONCE, then runs the ray-tracing
+    sweep separately for each sub-array. Produces two CSV files:
+      - ..._W_north_v1.csv  (6+2 sub-array)
+      - ..._W_south_v1.csv  (4+2 sub-array)
+
+    Returns
+    -------
+    north_df, south_df : pd.DataFrame
+    """
+    start_time = time.time()
+
+    # --- Load & voxelize (once) ---
+    points, classifications = load_and_prepare_lidar(
+        lidar_file_path, relevant_classes=RELEVANT_CLASSES
+    )
+    class_grid, dens_grid, scene_min, grid_dims = voxelize_scene(
+        points, classifications, voxel_size, BETA_FINLAND
+    )
+
+    # --- Build panel points ---
+    print("\n  --- Sub-array: North (6, 2) — left-aligned ---")
+    print("    Panels: 2-1-1…2-1-6 (row 0), 2-1-7…2-1-8 (row 1)")
+    north_z = _find_roof_z(points, classifications, NORTH_CORNER_2D,
+                           ROOF_SEARCH_RADIUS, offset_from_roof, scene_min[2])
+    north_corner = np.array([NORTH_CORNER_2D[0], NORTH_CORNER_2D[1], north_z])
+    north_pts = generate_pv_array_points(
+        north_corner, tilt_deg=20, az_deg=260,
+        panel_width_m=1.0, panel_height_m=1.6,
+        row_configuration=(6, 2), align="left",
+    )
+    print(f"    {len(north_pts)} panel points")
+
+    print("\n  --- Sub-array: South (4, 2) — right-aligned ---")
+    print("    Panels: 2-2-1…2-2-4 (row 0), 2-2-5…2-2-6 (row 1)")
+    south_z = _find_roof_z(points, classifications, SOUTH_CORNER_2D,
+                           ROOF_SEARCH_RADIUS, offset_from_roof, scene_min[2])
+    south_corner = np.array([SOUTH_CORNER_2D[0], SOUTH_CORNER_2D[1], south_z])
+    south_pts = generate_pv_array_points(
+        south_corner, tilt_deg=20, az_deg=260,
+        panel_width_m=1.0, panel_height_m=1.6,
+        row_configuration=(4, 2), align="right",
+    )
+    print(f"    {len(south_pts)} panel points")
+
+    # --- Shared setup ---
+    cone_offsets = precompute_cone_offsets(NUM_RAYS_PER_CONE)
+    solar_radius_rad = np.deg2rad(SOLAR_ANGULAR_RADIUS_DEG)
+    k_base = K_BASE_FINLAND
+
+    print(f"\n  Self-occlusion skip distance: {skip_dist:.1f}m "
+          f"(voxel_size={voxel_size}m)")
+
+    scene_min_c = np.ascontiguousarray(scene_min)
+    grid_dims_c = np.ascontiguousarray(grid_dims)
+    class_grid_c = np.ascontiguousarray(class_grid)
+    dens_grid_c = np.ascontiguousarray(dens_grid)
+
+    # --- JIT warm-up ---
+    print("\n--- JIT warm-up (first trace) ---")
+    _wu_dirs = build_cone_directions(
+        np.array([0.0, 0.0, 1.0]), solar_radius_rad, cone_offsets
+    )
+    _ = trace_batch(
+        np.ascontiguousarray(north_pts), _wu_dirs, scene_min_c, voxel_size,
+        grid_dims_c, class_grid_c, dens_grid_c, k_base,
+        GROUND_CLASS, BUILDING_CLASS, buf_dist, skip_dist
+    )
+
+    # --- Sweep: North ---
+    north_df = _run_hemispherical_sweep(
+        north_pts, scene_min_c, voxel_size, grid_dims_c,
+        class_grid_c, dens_grid_c, k_base,
+        cone_offsets, solar_radius_rad,
+        buf_dist, skip_dist, label="North (6+2)",
+    )
+
+    # --- Sweep: South ---
+    south_df = _run_hemispherical_sweep(
+        south_pts, scene_min_c, voxel_size, grid_dims_c,
+        class_grid_c, dens_grid_c, k_base,
+        cone_offsets, solar_radius_rad,
+        buf_dist, skip_dist, label="South (4+2)",
+    )
 
     # --- Save ---
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-        out_path = os.path.join(output_dir, output_fn)
-        matrix_df.to_csv(out_path, header=True, index=True)
-        print(f"\nSaved shadow attenuation matrix to {out_path}")
+
+        north_path = os.path.join(output_dir,
+            f"shadow_attenuation_matrix_conecasting_W_north_{file_name_suffix}.csv")
+        north_df.to_csv(north_path, header=True, index=True)
+        print(f"\nSaved North matrix to {north_path}")
+
+        south_path = os.path.join(output_dir,
+            f"shadow_attenuation_matrix_conecasting_W_south_{file_name_suffix}.csv")
+        south_df.to_csv(south_path, header=True, index=True)
+        print(f"Saved South matrix to {south_path}")
 
     total_time = time.time() - start_time
-    print(f"Total execution time: {total_time:.2f}s "
+    print(f"\nTotal execution time: {total_time:.2f}s "
           f"({total_time / 60:.1f} min)")
-    return matrix_df
+    return north_df, south_df
 
 
 # ============================================================================
@@ -761,14 +664,13 @@ def create_shadow_matrix(
 
 if __name__ == "__main__":
     LIDAR_FILE_PATH = "output/reclassified_final_v5.laz"
-    OUTPUT_DIRECTORY = "results/shadow_matrix_results_SE_pro"
-    OUTPUT_FILENAME = "shadow_attenuation_matrix_conecasting_SE_v6.csv"
+    OUTPUT_DIRECTORY = "results/shadow_matrix_results_W_pro"
 
-    create_shadow_matrix(
+    create_shadow_matrices(
         lidar_file_path=LIDAR_FILE_PATH,
         voxel_size=2.0,
         output_dir=OUTPUT_DIRECTORY,
-        output_fn=OUTPUT_FILENAME,
         offset_from_roof=OFFSET_FROM_ROOF,
         skip_dist=SKIP_DISTANCE,
+        file_name_suffix="v1",
     )

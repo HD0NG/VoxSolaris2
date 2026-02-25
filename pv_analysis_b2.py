@@ -301,6 +301,7 @@ def load_inverter_data(
     expected_interval_min: float = 5.0,
     tolerance_min: float = 1.0,
     center_timestamps: bool = False,
+    energy_column: Optional[Union[int, str]] = None,
 ) -> pd.DataFrame:
     """
     Load Fronius inverter energy data and convert Wh -> W.
@@ -310,22 +311,34 @@ def load_inverter_data(
       - Row 1: Units ([dd.MM.yyyy HH:mm], [Wh], ...)
       - Data from row 2, timestamps FIXED UTC+3
 
-    Handles missing records:
-      - Uses actual time deltas for Wh -> W
-      - Caps unreasonable power spikes from tiny gaps
-      - Reports gap statistics
-
     Parameters
     ----------
+    energy_column : int or str, optional
+        Which column contains the energy data.
+        - int: column index (0-based). Default is 2 (Bank 1 / MPP1).
+        - str: partial column name match from row 0 headers
+          (e.g., 'MPP2' to select Bank 2).
     center_timestamps : bool
-        If True (default), shift timestamps back by half the interval
-        (2.5 min for 5-min data). The Fronius logger timestamps the
-        END of the accumulation period, but the average power was
-        generated during the interval, centered 2.5 min earlier.
-        This corrects the ~2.5-minute latency between forecast
-        (instantaneous solar position) and measured energy.
+        If True, shift timestamps back by half the interval.
     """
-    df = pd.read_excel(excel_path, usecols=[0, 2], skiprows=[0, 1], header=None)
+    if energy_column is None:
+        energy_column = 2
+
+    if isinstance(energy_column, str):
+        # Read header row to find column by name
+        headers = pd.read_excel(excel_path, nrows=1, header=None).iloc[0]
+        matches = [i for i, h in enumerate(headers) if energy_column in str(h)]
+        if not matches:
+            raise ValueError(
+                f"No column matching '{energy_column}' found. "
+                f"Available: {list(headers.values)}"
+            )
+        col_idx = matches[0]
+        print(f"  Energy column: '{headers[col_idx]}' (index {col_idx})")
+    else:
+        col_idx = energy_column
+
+    df = pd.read_excel(excel_path, usecols=[0, col_idx], skiprows=[0, 1], header=None)
     df.columns = ["Timestamp", "Energy_Wh"]
     df["Timestamp"] = pd.to_datetime(df["Timestamp"], format="%d.%m.%Y %H:%M")
 
