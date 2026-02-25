@@ -48,7 +48,7 @@ K_BASE_FINLAND = 1.0 / BETA_FINLAND  # ≈ 0.481
 # OMEGA_S is retained for reference but NOT used to scale k.
 OMEGA_S = 0.56
 
-TARGET_COORDS_2D = np.array([532881.51, 6983506.91])  # Bank 1 corner — derived from panel 1-10 at (532882.00, 6983507.00)
+TARGET_COORDS_2D = np.array([532882.00, 6983507.00])  # Bank 1 corner — derived from panel 1-10 at (532882.00, 6983507.00)
 ROOF_SEARCH_RADIUS = 3.0
 OFFSET_FROM_ROOF = -0.5
 SKIP_DISTANCE = 3.0  # meters to skip building/ground voxels near origin
